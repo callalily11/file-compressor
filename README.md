@@ -36,6 +36,10 @@ npm test
 
 静的ホスティングへ `dist/` を配置できます。サーバー API、認証、データベースは必要ありません。
 
+### GitHub Pages への公開
+
+このリポジトリでは `main` への push 時に GitHub Actions が `dist/` を GitHub Pages へ公開します。最初の一度だけ GitHub の **Settings → Pages → Build and deployment → Source** で **GitHub Actions** を選んでください。公開URLは `https://callalily11.github.io/file-compressor/` です。
+
 ## 検証計画
 
 リリース前に Chrome / Safari（macOS）と Safari（iPhone）で、5MB・30MB・100MB の JPEG、透過 PNG、建築図面 PDF、写真中心・文字中心の PDF、複数同時処理、キャンセル、出力再表示を確認します。PDF はページ数・文字・ページ寸法・視覚品質を原本と比較します。100MB のファイルは端末のメモリ状況によって失敗することがあります。
