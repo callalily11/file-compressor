@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatBytes, isSupported, outputName, reduction } from './file'
+import { formatBytes, isSupported, MAX_BYTES, outputName, reduction } from './file'
 
 describe('file helpers', () => {
   it('accepts only supported types and extensions', () => {
@@ -12,5 +12,9 @@ describe('file helpers', () => {
     expect(formatBytes(1024 * 1024)).toBe('1.00 MB')
     expect(reduction(100, 25)).toBe('75.0%')
     expect(reduction(100, 120)).toBe('0.0%')
+  })
+
+  it('sets the per-file limit to 300MB', () => {
+    expect(MAX_BYTES).toBe(300 * 1024 * 1024)
   })
 })
