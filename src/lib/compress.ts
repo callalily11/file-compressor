@@ -60,7 +60,7 @@ async function recompressEmbeddedPdfImages(document: PDFDocument, quality: numbe
   return { changed, total: images.length }
 }
 
-async function optimizePdfImagesWithQpdf(source: Uint8Array, quality: number, cancelled: () => boolean, onProgress: (n: number) => void) {
+async function optimizePdfImagesWithQpdf(source: Uint8Array, quality: number, dpi: number, cancelled: () => boolean, onProgress: (n: number) => void) {
   if (source.byteLength > 256 * 1024 * 1024) return { bytes: undefined, changed: 0, total: 0, reason: 'PDF画像最適化は256MBまで対応しています。' }
   const qpdf = await createQpdfImageStreams({ locateFile: name => name.endsWith('.wasm') ? `${import.meta.env.BASE_URL}qpdf-image-stream.wasm` : name })
   const loaded = qpdf.loadPdf(source)
@@ -76,7 +76,11 @@ async function optimizePdfImagesWithQpdf(source: Uint8Array, quality: number, ca
       const info = candidates[index]
       const read = pdf.readImage(info.objId, info.generation)
       if (!read.ok) continue
-      const bitmapResult = await toImageBitmap(read.value, info)
+      const page = info.pages.length ? pdf.getPageInfo(info.pages[0]) : undefined
+      const maxWidth = page?.ok ? Math.round((page.value.mediaBox.width / 72) * dpi) : info.width
+      const maxHeight = page?.ok ? Math.round((page.value.mediaBox.height / 72) * dpi) : info.height
+      const scale = Math.min(1, maxWidth / info.width, maxHeight / info.height)
+      const bitmapResult = await toImageBitmap(read.value, info, { resizeWidth: Math.max(1, Math.round(info.width * scale)), resizeHeight: Math.max(1, Math.round(info.height * scale)), resizeQuality: 'high' })
       if (!bitmapResult.ok) continue
       const bitmap = bitmapResult.value
       const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height
@@ -124,14 +128,14 @@ export async function compressImage(file: File, quality: number, dpi: number, ca
   return result.size < file.size ? { file: result } : { file, message: '圧縮後の容量が増えるため、元ファイルを保持しました。' }
 }
 
-export async function processPdf(file: File, quality: number, cancelled: () => boolean, onProgress: (n: number) => void) {
+export async function processPdf(file: File, quality: number, dpi: number, cancelled: () => boolean, onProgress: (n: number) => void) {
   checkCancelled(cancelled)
   const pages = await inspectPdf(file)
   const source = new Uint8Array(await file.arrayBuffer())
   checkCancelled(cancelled)
   if (hasPdfSignatureMarker(source)) return { file, pages, message: '署名付きPDFのため、署名を保護して元ファイルを保持しました。' }
   try {
-    const qpdfResult = await optimizePdfImagesWithQpdf(source, quality, cancelled, onProgress)
+    const qpdfResult = await optimizePdfImagesWithQpdf(source, quality, dpi, cancelled, onProgress)
     const document = await PDFDocument.load(qpdfResult.bytes ?? source, { updateMetadata: false })
     if (document.getForm().getFields().length > 0) return { file, pages, message: 'フォーム付きPDFのため、入力内容を保護して元ファイルを保持しました。' }
     const imageResult = qpdfResult.bytes ? { changed: qpdfResult.changed, total: qpdfResult.total } : await recompressEmbeddedPdfImages(document, quality, cancelled, onProgress)
