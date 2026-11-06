@@ -6,6 +6,8 @@ import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { outputName } from './file'
 import { setJpegDpi } from './jpeg'
 import { hasPdfSignatureMarker } from './pdf'
+import { createQpdfImageStreams } from '@lipoe/browser-qpdf'
+import { canDecode, toImageBitmap } from '@lipoe/browser-qpdf/codecs'
 
 GlobalWorkerOptions.workerSrc = pdfWorker
 
@@ -58,6 +60,39 @@ async function recompressEmbeddedPdfImages(document: PDFDocument, quality: numbe
   return { changed, total: images.length }
 }
 
+async function optimizePdfImagesWithQpdf(source: Uint8Array, quality: number, cancelled: () => boolean, onProgress: (n: number) => void) {
+  if (source.byteLength > 256 * 1024 * 1024) return { bytes: undefined, changed: 0, total: 0, reason: 'PDF画像最適化は256MBまで対応しています。' }
+  const qpdf = await createQpdfImageStreams({ locateFile: name => name.endsWith('.wasm') ? `${import.meta.env.BASE_URL}qpdf-image-stream.wasm` : name })
+  const loaded = qpdf.loadPdf(source)
+  if (!loaded.ok) return { bytes: undefined, changed: 0, total: 0, reason: 'PDFを安全に読み取れませんでした。' }
+  const pdf = loaded.value
+  try {
+    const listed = pdf.getImages({ recursive: true })
+    if (!listed.ok) return { bytes: undefined, changed: 0, total: 0, reason: 'PDF内画像を取得できませんでした。' }
+    const candidates = listed.value.filter(info => !info.masks.isStencilMask && info.masks.softMaskOf.length === 0 && canDecode(info).ok)
+    let changed = 0
+    for (let index = 0; index < candidates.length; index += 1) {
+      checkCancelled(cancelled)
+      const info = candidates[index]
+      const read = pdf.readImage(info.objId, info.generation)
+      if (!read.ok) continue
+      const bitmapResult = await toImageBitmap(read.value, info)
+      if (!bitmapResult.ok) continue
+      const bitmap = bitmapResult.value
+      const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height
+      const context = canvas.getContext('2d'); if (!context) { bitmap.close(); continue }
+      context.drawImage(bitmap, 0, 0); bitmap.close()
+      const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', Math.max(1, Math.min(100, quality)) / 100))
+      if (!blob || blob.size >= info.streamLength) continue
+      const replaced = pdf.replaceImageStream(info.objId, info.generation, new Uint8Array(await blob.arrayBuffer()), { width: canvas.width, height: canvas.height, bitsPerComponent: 8, colorSpace: 'DeviceRGB', filter: 'DCTDecode' })
+      if (replaced.ok) changed += 1
+      onProgress(15 + Math.round(((index + 1) / Math.max(candidates.length, 1)) * 65))
+    }
+    const output = pdf.writePdf()
+    return output.ok ? { bytes: output.value, changed, total: candidates.length, reason: undefined } : { bytes: undefined, changed, total: candidates.length, reason: 'PDFを書き出せませんでした。' }
+  } finally { pdf.close() }
+}
+
 export async function inspectPdf(file: File) {
   const bytes = await file.arrayBuffer()
   const pdf = await getDocument({ data: bytes }).promise
@@ -96,11 +131,12 @@ export async function processPdf(file: File, quality: number, cancelled: () => b
   checkCancelled(cancelled)
   if (hasPdfSignatureMarker(source)) return { file, pages, message: '署名付きPDFのため、署名を保護して元ファイルを保持しました。' }
   try {
-    const document = await PDFDocument.load(source, { updateMetadata: false })
+    const qpdfResult = await optimizePdfImagesWithQpdf(source, quality, cancelled, onProgress)
+    const document = await PDFDocument.load(qpdfResult.bytes ?? source, { updateMetadata: false })
     if (document.getForm().getFields().length > 0) return { file, pages, message: 'フォーム付きPDFのため、入力内容を保護して元ファイルを保持しました。' }
-    const imageResult = await recompressEmbeddedPdfImages(document, quality, cancelled, onProgress)
+    const imageResult = qpdfResult.bytes ? { changed: qpdfResult.changed, total: qpdfResult.total } : await recompressEmbeddedPdfImages(document, quality, cancelled, onProgress)
     checkCancelled(cancelled); onProgress(85)
-    const optimized = await document.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false, objectsPerTick: 50 })
+    const optimized = qpdfResult.bytes ?? await document.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false, objectsPerTick: 50 })
     checkCancelled(cancelled)
     const buffer = optimized.buffer.slice(optimized.byteOffset, optimized.byteOffset + optimized.byteLength) as ArrayBuffer
     const result = new File([buffer], outputName(file.name), { type: 'application/pdf', lastModified: Date.now() })
