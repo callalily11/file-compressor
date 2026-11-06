@@ -36,7 +36,7 @@ export function App() {
       update(item.id, { status: 'processing', progress: 1, message: undefined })
       try {
         const result = item.file.type === 'application/pdf'
-          ? await processPdf(item.file, () => cancelled.current, n => update(item.id, { progress: n }))
+          ? await processPdf(item.file, jpegQuality, () => cancelled.current, n => update(item.id, { progress: n }))
           : await compressImage(item.file, jpegQuality, dpi, () => cancelled.current, n => update(item.id, { progress: n }))
         if (cancelled.current) throw new CancelledError()
         const pages = 'pages' in result && typeof result.pages === 'number' ? result.pages : item.pages

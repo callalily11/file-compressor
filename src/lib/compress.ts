@@ -10,6 +10,28 @@ GlobalWorkerOptions.workerSrc = pdfWorker
 
 export class CancelledError extends Error { constructor() { super('処理を中止しました') } }
 const checkCancelled = (cancelled: () => boolean) => { if (cancelled()) throw new CancelledError() }
+type MutablePdfImage = { contents: Uint8Array; dict: { entries: () => [unknown, unknown][] } }
+const dictionaryEntry = (image: MutablePdfImage, name: string) => image.dict.entries().find(([key]) => String(key) === `/${name}`)?.[1]
+const isEligiblePdfImage = (image: MutablePdfImage) => String(dictionaryEntry(image, 'Subtype')) === '/Image' && String(dictionaryEntry(image, 'Filter')).includes('/DCTDecode') && String(dictionaryEntry(image, 'ColorSpace')) === '/DeviceRGB' && !dictionaryEntry(image, 'SMask')
+
+async function recompressEmbeddedPdfImages(document: PDFDocument, quality: number, cancelled: () => boolean, onProgress: (n: number) => void) {
+  const context = document.context as unknown as { indirectObjects: Map<unknown, unknown> }
+  const images = Array.from(context.indirectObjects.values()).filter((value): value is MutablePdfImage => {
+    const image = value as Partial<MutablePdfImage>
+    return image.contents instanceof Uint8Array && typeof image.dict?.entries === 'function' && isEligiblePdfImage(image as MutablePdfImage)
+  })
+  let changed = 0
+  for (let index = 0; index < images.length; index += 1) {
+    checkCancelled(cancelled)
+    const image = images[index]
+    const source = image.contents
+    const sourceBuffer = source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength) as ArrayBuffer
+    const compressed = await imageCompression(new File([sourceBuffer], 'embedded-image.jpg', { type: 'image/jpeg' }), { maxSizeMB: Math.max(0.01, source.byteLength / 1024 / 1024), initialQuality: Math.max(1, Math.min(100, quality)) / 100, useWebWorker: true, fileType: 'image/jpeg' })
+    if (compressed.size < source.byteLength) { image.contents = new Uint8Array(await compressed.arrayBuffer()); changed += 1 }
+    onProgress(15 + Math.round(((index + 1) / Math.max(images.length, 1)) * 65))
+  }
+  return { changed, total: images.length }
+}
 
 export async function inspectPdf(file: File) {
   const bytes = await file.arrayBuffer()
@@ -42,7 +64,7 @@ export async function compressImage(file: File, quality: number, dpi: number, ca
   return result.size < file.size ? { file: result } : { file, message: '圧縮後の容量が増えるため、元ファイルを保持しました。' }
 }
 
-export async function processPdf(file: File, cancelled: () => boolean, onProgress: (n: number) => void) {
+export async function processPdf(file: File, quality: number, cancelled: () => boolean, onProgress: (n: number) => void) {
   checkCancelled(cancelled)
   const pages = await inspectPdf(file)
   const source = new Uint8Array(await file.arrayBuffer())
@@ -51,14 +73,20 @@ export async function processPdf(file: File, cancelled: () => boolean, onProgres
   try {
     const document = await PDFDocument.load(source, { updateMetadata: false })
     if (document.getForm().getFields().length > 0) return { file, pages, message: 'フォーム付きPDFのため、入力内容を保護して元ファイルを保持しました。' }
-    checkCancelled(cancelled); onProgress(50)
+    const imageResult = await recompressEmbeddedPdfImages(document, quality, cancelled, onProgress)
+    checkCancelled(cancelled); onProgress(85)
     const optimized = await document.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false, objectsPerTick: 50 })
-    checkCancelled(cancelled); onProgress(100)
+    checkCancelled(cancelled)
     const buffer = optimized.buffer.slice(optimized.byteOffset, optimized.byteOffset + optimized.byteLength) as ArrayBuffer
     const result = new File([buffer], outputName(file.name), { type: 'application/pdf', lastModified: Date.now() })
+    const verified = await getDocument({ data: await result.arrayBuffer() }).promise
+    const valid = verified.numPages === pages
+    await verified.cleanup()
+    onProgress(100)
+    if (!valid) return { file, pages, message: '軽量化後のPDFを検証できないため、元ファイルを保持しました。' }
     return result.size < file.size
-      ? { file: result, pages, message: 'PDFの構造を整理して軽量化しました。画像の再圧縮やページの画像化は行っていません。' }
-      : { file, pages, message: '軽量化の効果がなかったため、元ファイルを保持しました。' }
+      ? { file: result, pages, message: `PDF内のJPEG画像 ${imageResult.changed}/${imageResult.total} 件を再圧縮し、構造を整理しました。文字・ベクター・ページは画像化していません。` }
+      : { file, pages, message: imageResult.total === 0 ? '再圧縮できるJPEG画像が見つからず、軽量化の効果がなかったため元ファイルを保持しました。' : '軽量化後の容量が増えたため、元ファイルを保持しました。' }
   } catch {
     return { file, pages, message: '暗号化または安全に再保存できないPDFのため、元ファイルを保持しました。' }
   }
