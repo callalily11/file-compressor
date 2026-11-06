@@ -1,8 +1,8 @@
 import imageCompression from 'browser-image-compression'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
-import type { Quality } from '../types'
-import { outputName, qualityOptions } from './file'
+import { outputName } from './file'
+import { setJpegDpi } from './jpeg'
 
 GlobalWorkerOptions.workerSrc = pdfWorker
 
@@ -17,7 +17,7 @@ export async function inspectPdf(file: File) {
   return pages
 }
 
-export async function compressImage(file: File, quality: Quality, cancelled: () => boolean, onProgress: (n: number) => void) {
+export async function compressImage(file: File, quality: number, dpi: number, cancelled: () => boolean, onProgress: (n: number) => void) {
   checkCancelled(cancelled)
   if (file.type === 'image/png') {
     // Canvas re-encoding can lose color-profile metadata. Preserve the original until
@@ -25,17 +25,18 @@ export async function compressImage(file: File, quality: Quality, cancelled: () 
     onProgress(100)
     return { file, message: 'PNG は透明・色情報を保護するため、今回は元ファイルを保持しました。' }
   }
-  const setting = qualityOptions[quality]
+  const clampedQuality = Math.max(1, Math.min(100, quality)) / 100
   const compressed = await imageCompression(file, {
     maxSizeMB: Math.max(0.1, file.size / 1024 / 1024),
-    maxWidthOrHeight: setting.maxWidth,
-    initialQuality: setting.quality,
+    initialQuality: clampedQuality,
     useWebWorker: true,
     fileType: 'image/jpeg',
     onProgress,
   })
   checkCancelled(cancelled)
-  const result = new File([compressed], outputName(file.name), { type: 'image/jpeg', lastModified: Date.now() })
+  const bytes = setJpegDpi(new Uint8Array(await compressed.arrayBuffer()), dpi)
+  const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+  const result = new File([buffer], outputName(file.name), { type: 'image/jpeg', lastModified: Date.now() })
   return result.size < file.size ? { file: result } : { file, message: '圧縮後の容量が増えるため、元ファイルを保持しました。' }
 }
 
