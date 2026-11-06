@@ -1,5 +1,6 @@
 import imageCompression from 'browser-image-compression'
 import { PDFDocument } from 'pdf-lib'
+import PDFName from 'pdf-lib/es/core/objects/PDFName'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { outputName } from './file'
@@ -10,24 +11,48 @@ GlobalWorkerOptions.workerSrc = pdfWorker
 
 export class CancelledError extends Error { constructor() { super('処理を中止しました') } }
 const checkCancelled = (cancelled: () => boolean) => { if (cancelled()) throw new CancelledError() }
-type MutablePdfImage = { contents: Uint8Array; dict: { entries: () => [unknown, unknown][] } }
+type MutablePdfImage = { contents: Uint8Array; dict: { entries: () => [unknown, unknown][]; set: (key: PDFName, value: PDFName) => void; delete: (key: PDFName) => boolean } }
 const dictionaryEntry = (image: MutablePdfImage, name: string) => image.dict.entries().find(([key]) => String(key) === `/${name}`)?.[1]
-const isEligiblePdfImage = (image: MutablePdfImage) => String(dictionaryEntry(image, 'Subtype')) === '/Image' && String(dictionaryEntry(image, 'Filter')).includes('/DCTDecode') && String(dictionaryEntry(image, 'ColorSpace')) === '/DeviceRGB' && !dictionaryEntry(image, 'SMask')
+const isRgbPdfImage = (image: MutablePdfImage) => String(dictionaryEntry(image, 'Subtype')) === '/Image' && String(dictionaryEntry(image, 'ColorSpace')) === '/DeviceRGB' && !dictionaryEntry(image, 'SMask') && !dictionaryEntry(image, 'DecodeParms') && Number((dictionaryEntry(image, 'BitsPerComponent') as { asNumber?: () => number } | undefined)?.asNumber?.()) === 8
+const isEligiblePdfImage = (image: MutablePdfImage) => isRgbPdfImage(image) && String(dictionaryEntry(image, 'Filter')).includes('/DCTDecode')
+const isFlateRgbPdfImage = (image: MutablePdfImage) => isRgbPdfImage(image) && String(dictionaryEntry(image, 'Filter')) === '/FlateDecode'
+const dimension = (image: MutablePdfImage, name: string) => Number((dictionaryEntry(image, name) as { asNumber?: () => number } | undefined)?.asNumber?.())
+
+async function encodeRgbPdfImage(image: MutablePdfImage, quality: number) {
+  const compressed = image.contents
+  const buffer = compressed.buffer.slice(compressed.byteOffset, compressed.byteOffset + compressed.byteLength) as ArrayBuffer
+  const decompressed = new Uint8Array(await new Response(new Blob([buffer]).stream().pipeThrough(new DecompressionStream('deflate'))).arrayBuffer())
+  const width = dimension(image, 'Width'); const height = dimension(image, 'Height')
+  if (!width || !height || decompressed.byteLength !== width * height * 3) return undefined
+  const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height
+  const context = canvas.getContext('2d'); if (!context) return undefined
+  const rgba = new Uint8ClampedArray(width * height * 4)
+  for (let source = 0, target = 0; source < decompressed.length; source += 3, target += 4) { rgba[target] = decompressed[source]; rgba[target + 1] = decompressed[source + 1]; rgba[target + 2] = decompressed[source + 2]; rgba[target + 3] = 255 }
+  context.putImageData(new ImageData(rgba, width, height), 0, 0)
+  const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', Math.max(1, Math.min(100, quality)) / 100))
+  return blob ? new Uint8Array(await blob.arrayBuffer()) : undefined
+}
 
 async function recompressEmbeddedPdfImages(document: PDFDocument, quality: number, cancelled: () => boolean, onProgress: (n: number) => void) {
   const context = document.context as unknown as { indirectObjects: Map<unknown, unknown> }
   const images = Array.from(context.indirectObjects.values()).filter((value): value is MutablePdfImage => {
     const image = value as Partial<MutablePdfImage>
-    return image.contents instanceof Uint8Array && typeof image.dict?.entries === 'function' && isEligiblePdfImage(image as MutablePdfImage)
+    return image.contents instanceof Uint8Array && typeof image.dict?.entries === 'function' && (isEligiblePdfImage(image as MutablePdfImage) || isFlateRgbPdfImage(image as MutablePdfImage))
   })
   let changed = 0
   for (let index = 0; index < images.length; index += 1) {
     checkCancelled(cancelled)
     const image = images[index]
     const source = image.contents
-    const sourceBuffer = source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength) as ArrayBuffer
-    const compressed = await imageCompression(new File([sourceBuffer], 'embedded-image.jpg', { type: 'image/jpeg' }), { maxSizeMB: Math.max(0.01, source.byteLength / 1024 / 1024), initialQuality: Math.max(1, Math.min(100, quality)) / 100, useWebWorker: true, fileType: 'image/jpeg' })
-    if (compressed.size < source.byteLength) { image.contents = new Uint8Array(await compressed.arrayBuffer()); changed += 1 }
+    const isFlate = isFlateRgbPdfImage(image)
+    const candidate = isFlate
+      ? await encodeRgbPdfImage(image, quality)
+      : new Uint8Array(await (await imageCompression(new File([source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength) as ArrayBuffer], 'embedded-image.jpg', { type: 'image/jpeg' }), { maxSizeMB: Math.max(0.01, source.byteLength / 1024 / 1024), initialQuality: Math.max(1, Math.min(100, quality)) / 100, useWebWorker: true, fileType: 'image/jpeg' })).arrayBuffer())
+    if (candidate && candidate.byteLength < source.byteLength) {
+      image.contents = candidate
+      if (isFlate) { image.dict.set(PDFName.of('Filter'), PDFName.of('DCTDecode')); image.dict.delete(PDFName.of('DecodeParms')) }
+      changed += 1
+    }
     onProgress(15 + Math.round(((index + 1) / Math.max(images.length, 1)) * 65))
   }
   return { changed, total: images.length }
