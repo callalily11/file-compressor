@@ -1,6 +1,6 @@
 import type { Quality } from '../types'
 
-export const MAX_BYTES = 100 * 1024 * 1024
+export const MAX_BYTES = 300 * 1024 * 1024
 export const qualityOptions: Record<Quality, { label: string; quality: number; maxWidth: number }> = {
   high: { label: '高画質', quality: 0.9, maxWidth: 5000 },
   standard: { label: '標準', quality: 0.75, maxWidth: 3600 },
